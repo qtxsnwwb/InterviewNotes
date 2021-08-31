@@ -62,3 +62,44 @@ void quick_sort(int s[], int l, int r)
     }
 }
 ```
+
+
+# 向上转型和向下转型
+1. 父类引用指向子类对象，而子类引用不能指向父类对象
+2. 把子类对象直接赋给父类引用叫向上转型，向上转型不用强制转换
+```java
+Father f1 = new Son()
+```
+3. 把指向子类对象的父类引用赋给子类引用叫向下转型，要强制转换
+```java
+Son s1 = (Son) f1
+```
+* 向上转型调用方法
+> 只能调用父类方法，当某方法在子类重写时，调用的是子类重写的方法。无法调用子类独有的方法
+* 向下转型调用方法
+> 实际变为了子类引用指向子类对象，调用的都是子类方法
+
+
+
+# Comparable 和 Comparator
+**1. Comparable**
+```java
+public interface Comparable<T> {
+	int compareTo(T t);
+}
+```
+* 若一个类实现了 Comparable 接口，只需重写 compareTo()，就可按自己制定的规则将它创建的对象进行比较
+
+**2. Comparator**
+```java
+public interface Comparator<T> {
+	int compare(T o1, T o2);
+	boolean equals(Object obj);
+}
+```
+* 可保持类的原貌，不主动实现 Comparable 接口。通过自定义比较器类（继承 Comparator），来调用该类从而实现比较
+
+**3. 区别**
+* 一个类实现了 Comparable 接口，意味着该类的对象可以直接进行比较（排序），但比较的方式只有一种
+* 一个类若想保持原样，又需要进行不同方式的比较（排序），就可以定制比较器（实现 Comparator 接口）
+* Comparable 接口在 java.lang 包下，而 Comparator 接口在 java.util 包下
