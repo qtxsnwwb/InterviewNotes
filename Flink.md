@@ -436,3 +436,155 @@
     - reduce 转换不会改变数据类型，因此输出流的类型会永远和输入流保持一致
     - 只能用于键值域有限的流
 
+#### 多流转换
+* **Union**
+    - DataStream.union() 方法可以合并两条或多条类型相同的 DataStream，生成一个新的类型相同的 DataStream，这样后续的转换操作就可以对所有输入流中的元素统一处理
+    - union 执行过程中，来自两条流的事件会以 FIFO（先进先出）的方式合并，其顺序无法得到任何保证
+    - union 算子不会对数据进行去重，每个输入消息都会被发往下游算子
+* **Connect，coMap，coFlatMap**
+    - DataStream.connect() 方法接收一个 DataStream 并返回一个 ConnectedStreams 对象，该对象表示两个联结起来（connected）的流
+    - ConnectedStreams 对象提供了 map() 和 flatMap() 方法，它们分别接收一个 CoMapFunction 和一个 CoFlatMapFunction 作为参数
+    - 两个函数都是以两条输入流的类型外加输出流的类型作为其类型参数，它们为两条输入流定义了各自的处理方法
+    - CoMapFunction 和 CoFlatMapFunction 内方法的调用顺序无法控制。一旦对应流中有事件到来，系统就需要调用对应的方法
+    - 默认情况下，connect() 方法不会使两条输入流的事件之间产生任何关联，因此所有事件都会随机分配给算子实例。该行为会产生不确定的结果，而这往往并不是我们希望看到的。为了在 ConnectedStreams 上实现确定性的转换，connect() 可以与 keyBy() 和 broadcast() 结合使用
+* **Split 和 Select**
+    - split 转换是 union 转换的逆操作。它将输入流分割成两条或多条**类型和输入流相同的输出流**
+    - 每一个到来的事件都可以被发往零个、一个或多个输出流。因此，split 也可以用来过滤或复制事件
+    - DataStream.split() 方法会返回一个 SplitStream 对象，它提供的 select() 方法可以让我们通过指定输出名称的方式从 SplitStream 中选择一条或多条流
+
+#### 分发转换
+* **随机**
+    - 利用 DataStream.shuffle() 方法实现随机数据交换策略。该方法会依照均匀分布随机地将记录发往后继算子的并行任务
+* **轮流**
+    - rebalance() 方法会将输入流中的事件以轮流方法均匀分配给后继任务
+* **重调**
+    - rescale() 也会以轮流方式对事件进行分发，但分发目标仅限于部分后继任务
+    - 本质上看，重调分区策略为发送端和接收端任务不等的情况提供了一种轻量级的负载均衡方法。当接收端任务远大于发送端任务的时候，该方法会更有效，反之亦然
+    - rebalance() 和 rescale() 的本质不同体现在**生成任务连接的方式**。rebalance() 会在所有发送任务和接收任务之间建立通信通道；而 rescale() 中每个发送任务只会和下游算子的部分任务建立通道
+* **广播**
+    - broadcast() 方法会将输入流中的事件复制并发往所有下游算子的并行任务
+* **全局**
+    - global() 方法会将输入流中的所有事件发往下游算子的第一个并行任务
+
+> 使用此分区策略时需小心所有事件发往同一任务可能会影响程序性能
+
+* **自定义**
+    - 利用 partitionCustom() 方法自己定义分区策略。该方法接收一个 Partitioner 对象，可在其中实现分区逻辑，定义分区需要参照的字段或键值位置
+
+
+
+
+### 设置并行度
+* 每个算子都会产生一个或多个并行任务。每个任务负责处理算子的部分输入流。算子并行化任务的数目称为该算子的并行度。它决定了算子处理的并行化程度以及能够处理的数据规模
+* 默认情况下，应用内所有算子的并行度都会被设置为应用执行环境的并行度。而环境的并行度（即所有算子的默认并行度）则会根据应用启动时所处的上下文自动初始化
+* 如果应用是在一个本地执行环境中运行，并行度会设置为 CPU 的线程数目。如果应用是提交到 Flink 集群运行，那么除非提交客户端明确指定，否则环境并行度将设置为集群默认并行度
+* 一般情况下，最好将算子并行度设置为随环境默认并行度变化的值，这样就可以通过提交客户端来轻易调整并行度，从而实现应用的扩缩容
+
+
+
+
+### 类型
+#### 支持的数据类型
+* 原始类型
+* Java 和 Scala 元组
+    - Java 元组实现：最多可包含 25 个字段，每个字段长度都对应一个单独的实现类——Tuple1、Tuple2，直到 Tuple25。元组中的各个字段可以使用公有字段名称（f0、f1、f2 等）访问，也可以通过 getField(int pos) 方法基于位置访问，位置下标从 0 开始
+    - Java 元组是可变的，因此可以为其字段重新复制，Scala 不可
+* Scala 样例类
+* POJO（包括 Apache Avro 生成的类）
+    - Flink 会分析那些不属于任何一类的数据类型，并尝试将它们作为 POJO 类型进行处理。如果一个类满足如下条件，Flink 就会将它看做 POJO：
+        - 是一个公有类
+        - 有一个公有的无参默认构造函数
+        - 所有字段都是公有的或提供了相应的 getter 及 setter 方法。这些方法需要遵循默认的命名规范
+        - 所有字段类型都必须是 Flink 所支持的
+* 一些特殊类型
+    - Flink 支持多种具有特殊用途的类型，例如原始或对象类型的数组，Java 的 ArrayList、HashMap 及 Enum，Hadoop 的 Writable 类型等
+
+
+
+
+### 定义键值和引用字段
+#### 字段位置
+* 针对元组数据类型，可以简单地使用元组相应元素的字段位置来定义键值
+```scala
+val input: DataStream[(Int, String, Long)] = ...
+val keyed = input.keyBy(1)
+```
+
+#### 字段表达式
+* 使用基于字符串的字段表达式，可用于元组、POJO 以及样例类，同时还支持选择嵌套的字段
+```scala
+case class SensorReading(id:String, timestamp:Long, temperature:Double)
+val sensorStream: DataStream[SensorReading] = ...
+val keyedSensors = sensorStream.keyBy("id")
+```
+
+#### 键值选择器
+* 使用 KeySelector 函数，可以从输入事件中提取键值
+```scala
+val input: DataStream[(Int, Int)] = ...
+val keyedStream = input.keyBy(value => math.max(value._1, value._2))
+```
+
+
+
+
+### 实现函数
+#### 函数类
+* Flink 中所有用户自定义函数（如 MapFunction、FilterFunction 及 ProcessFunction）的接口都是以接口或抽象类的形式对外暴露
+* 我们可以通过实现接口或继承抽象类的方式实现函数
+* 当程序提交执行时，所有参数对象都会利用 Java 自身的序列化机制进行序列化，然后发送到对应算子的所有并行任务上。这样在对象反序列化后，全部配置值都可以保留
+
+> Flink 会利用 Java 序列化机制将所有函数对象序列化后发送到对应的工作进程。用户函数中的全部内容都必须是可序列化的
+> 如果有函数需要一个无法序列化的对象实例，可以选择使用富函数（rich function），在 open() 方法中将其初始化或者覆盖 Java 的序列化反序列化方法
+
+#### 富函数
+* 作用：在函数处理第一条记录之前进行一些初始化工作或是取得函数执行相关的上下文信息
+* DataStream API 中所有的转换函数都有对应的富函数。富函数的使用位置和普通函数以及 Lambda 函数相同。它们可以像普通函数类一样接收参数。富函数的命名规则是以 Rich 开头，后面跟着普通转换函数的名字，例如：RichMapFunction、RichFlatMapFunction 等
+* 富函数方法：
+    - open()：富函数中的初始化方法。它在每个任务首次调用转换方法（如 filter 或 map）前调用一次。open() **常用于那些只需进行一次的设置工作**
+    - close()：富函数中的终止方法，会在每个任务最后一次调用转换方法后调用一次，**常用于清理和释放资源**
+* 利用 getRuntimeContext() 方法访问函数的 RuntimeContext。在 RuntimeContext 中能够获取到一些信息，例如函数的并行度，函数所在的子任务的编号以及执行函数的任务名称。同时提供了访问分区状态的方法
+
+
+
+
+## 5. 基于时间和窗口的算子
+### 配置时间特性
+* 时间特性是 StreamExecutionEnvironment 的一个属性，它可以接收以下值：
+    - ProcessingTime：指定算子根据处理机器的系统时钟决定数据流当前的时间。处理时间窗口基于机器时间触发，它可以涵盖触发时间点之前到达算子的任意元素。通常情况下，**在窗口算子中使用处理时间会导致不确定的结果**，这是因为窗口内容取决于元素到达的速率。在该配置下，由于处理任务无须依靠等待水位线来驱动事件时间前进，所以可以提供极低的延迟
+    - EventTime：指定算子根据数据自身包含的信息决定当前事件。每个事件时间都带有一个时间戳，系统的逻辑时间是由水位线来定义。时间戳或是在数据进入处理管道之前就已经存在其中，或是需要由应用在数据源处分配。只有依靠水位线声明某个时间间隔内所有时间戳都已接收时，事件时间窗口才会触发。即便事件乱序到达，事件时间窗口也会计算出确定的结果。窗口结果不会取决于数据流的读取或处理速度
+    - IngestionTime：指定每个接收的记录都把数据源算子的处理时间作为事件时间的时间戳，并自动生成水位线。IngestionTime 是 EventTime 和 ProcessingTime 的混合体，它表示事件进入流处理引擎的事件。和事件时间相比，摄入时间（Ingestion time）的价值不大，因为它的性能和事件时间类似，但却无法提供确定的结果
+
+#### 分配时间戳和生成水位线
+* 每个事件都需要关联一个时间戳，该时间戳通常用来表示事件的实际发生时间；此外事件时间数据流还需要携带水位线，以供算子推断当前事件时间
+* DataStream API 中提供了 TimestampAssigner 接口，用于从已读入流式应用的元素中提取时间戳。通常情况下，应该在数据源函数后面立即调用时间戳分配器，因为大多数分配器在生成水位线的时候都会做出一些有关元素顺序相对时间戳的假设。由于元素的读取过程通常都是并行的，所以**一切引起 Flink 跨并行数据流分区进行重新分发的操作（例如改变并行度，keyBy() 或显式重新分发）都会导致元素的时间戳发生乱序**
+* 最佳做法就是尽可能靠近数据源的地方，甚至是 SourceFunction 内部，分配时间戳并生成水位线。根据用例的不同，如果某些初始化的过滤或其他转换操作不会引起元素的重新分发，那么可以考虑在分配时间戳之前就使用它们
+* 时间戳分配器的工作原理和其他转换算子类似。它们会作用在数据流的元素上面，生成一条带有时间戳和水位线的新数据流。时间戳分配器不会改变 DataStream 的数据类型
+
+##### 周期性水位线分配器
+* 周期性水位线分配器的含义是我们指示系统以固定的机器时间间隔来发出水位线并推动事件时间前进
+* 默认的时间间隔为 200 毫秒，但可以用 ExecutionConfig.setAutoWatermarkInterval() 方法对其进行配置
+```scala
+val env = StreamExecutionEnvironment.getExecutionEnvironment
+env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+// 每5秒生成一次水位线
+env.getConfig.setAutoWatermarkInterval(5000)
+```
+* 代码中 Flink 会每隔 5 秒调用一次 AssignerWithPeriodWatermarks 中的 getCurrentWatermark() 方法。如果该方法的返回值非空，且它的时间戳大于上一个水位线的时间戳，那么算子就会发出一个新的水位线。**这项检查对于保证事件时间持续递增十分必要，一旦检查失败将不会生成水位线**
+* DataStream API 内置了两个针对常见情况的周期性水位线时间戳分配器：
+    - 如果输入的元素的时间戳是单调增加的，则可以使用一个简便方法 assignAscendingTimeStamps。基于时间戳不会回退的事实，该方法使用当前时间戳生成水位线
+```scala
+val stream: DataStream[SensorReading] = ...
+val withTimestampsAndWatermarks = stream.assignAscendingTimestamps(e => e.timestamp)
+```
+    - 如果知道输入流中的延迟（任意新到元素和已到时间戳最大元素之间的时间差）上限，针对这种情况，Flink 提供了 BoundedOutOfOrdernessTimeStampExtractor，它接收一个表示最大预期延迟的参数
+```scala
+val stream: DataStream[SensorReading] = ...
+val output = stream.assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimestampExtractor[SensorReading](Time.seconds(10))(e => .timestamp))
+```
+
+##### 定点水位线分配器
+* 有时候输入流中会包含一些用于指示系统进度的特殊元组或标记。Flink 为此类情形以及可根据输入元素生成水位线的情形提供了 AssignerWithPunctuatedWatermarks 接口。该接口中的  checkAndGetNextWatermark() 方法会在针对每个事件的 extractTimestamp() 方法后立即调用。它可以决定是否生成一个新的水位线。如果该方法返回一个非空、且大于之前值的水位线，算子就会将这个新水位线发出
+
+#### 水位线、延迟及完整性问题
+* 水位线可用于平衡延迟和结果的完整性。它们控制着在执行某些计算（例如完成窗口计算并发出结果）前需要等待数据到达的时间。**基于事件时间的算子使用水位线来判断输入记录的完整度以及自身的操作进度**。根据收到的水位线，算子会计算一个所有相关输入记录都已接收完毕的预期时间点
