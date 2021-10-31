@@ -588,3 +588,569 @@ val output = stream.assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimes
 
 #### 水位线、延迟及完整性问题
 * 水位线可用于平衡延迟和结果的完整性。它们控制着在执行某些计算（例如完成窗口计算并发出结果）前需要等待数据到达的时间。**基于事件时间的算子使用水位线来判断输入记录的完整度以及自身的操作进度**。根据收到的水位线，算子会计算一个所有相关输入记录都已接收完毕的预期时间点
+
+
+
+
+### 处理函数
+* DataStream API 提供了一组相对底层的转换——处理函数，可以访问记录的时间戳和水位线，并支持在将来某个特定时间触发的计时器。此外，处理函数的副输出功能还允许将记录发送到多个输出流中
+* 处理函数常被用于构建事件驱动型应用，或实现一些内置窗口及转换无法实现的自定义逻辑。例如，大多数 Flink SQL 所支持的算子都是利用处理函数实现的
+* Flink 提供了 8 种不同的处理函数：
+    - ProcessFunction
+    - KeyedProcessFunction
+    - CoProcessFunction
+    - ProcessJoinFunction
+    - BroadcastProcessFunction
+    - KeyedBroadcastProcessFunction
+    - ProcessWindowFunction
+    - ProcessAllWindowFunction
+    - 下述以 KeyedProcessFunction 为例
+* KeyedProcessFunction 作用于 KeyedStream 之上，会针对流中的每条记录调用一次，并返回零个、一个或多个记录
+* 所有处理函数都实现了 RichFunction 接口，支持 open()、close()、getRuntimeContext() 等方法
+* KeyedProcessFunction 还提供了 2 个方法：
+    - processElement(v: IN, ctx: Context, out: Collector[OUT])：针对流中的每条记录调用一次，可以在方法中将结果记录传递给 Collector 发送出去。Context 对象是让处理函数与众不同的精华所在，可以通过它访问时间戳、当前记录的键值以及 TimerService。此外，Context 还支持将结果发送到副输出
+    - onTimer(timestamp: Long, ctx: OnTimerContext, out: Collector[OUT])：是一个回调函数，会在之前注册的计时器触发时被调用。timestamp 参数给出了所触发计时器的时间戳，Collector 可用来发出记录。OnTimerContext 能够提供和 processElement() 方法中的 Context 对象相同的服务，此外，它还会返回触发计时器的时间域（处理时间还是事件时间）
+
+#### 时间服务和计时器
+* Context 和 OnTimerContext 对象中的 TimeService 提供了以下方法：
+    - currentProcessingTime()：Long 返回当前的处理时间
+    - currentWatermark()：Long 返回当前水位线的时间戳
+    - registerProcessingTimeTimer(timestamp: Long)：Unit 针对当前键值注册一个处理时间计时器。当执行机器的处理时间到达给定的时间戳时，该计时器就会触发
+    - registerEventTimeTimer(timestamp: Long)：Unit 针对当前键值注册一个事件时间计时器。当更新后的水位线时间戳大于或等于计时器的时间戳时，它就会触发
+    - deleteProcessingTimeTimer(timestamp: Long)：Unit 针对当前键值删除一个注册过的处理时间计时器。如果该计时器不存在，则方法不会有任何作用
+    - deleteEventTimeTimer(timestamp: Long)：Unit 针对当前键值删除一个注册过的事件事件计时器。如果该计时器不存在，则方法不会有任何作用
+* 计时器触发时会调用 onTimer() 回调函数。系统对于 processElement() 和 onTimer() 两个方法的调用是同步的，这样可以防止并发访问和操作状态
+* 对于每个键值和时间戳只能注册一个计时器，即每个键值可以有多个计时器，但具体到每个时间戳就只能有一个。默认情况下，KeyedProcessFunction 会将全部计时器的时间戳放到堆中的一个优先队列里，同时也可以配置 RocksDB 状态后端来存放计时器
+
+#### 向副输出发送数据
+* 大多数 DataStream API 的算子都只有一个输出，即只能生成一条某个数据类型的结果流。而处理函数提供的副输出功能允许从同一函数发出多条数据流，且它们的类型可以不同。
+* 每个副输出都由一个 OutputTag[X]对象标识，其中 X 是副输出结果流的类型。处理函数可以利用 Context 对象将记录发送至一个或多个副输出
+
+#### CoProcessFunction
+* 针对有两个输入的底层操作，DataStream API 提供了 CoProcessFunction，它提供了一对作用在每个输入上的转换方法——processElement1() 和 processElement2()。在被调用时都会传入一个 Context 对象，用于访问当前元素或计时器时间戳、TimerService 及副输出。
+* CoProcessFunction 同样提供了 onTimer() 回调方法
+
+
+
+
+### 窗口算子
+* 窗口算子提供了一种基于有限大小的桶对事件进行分组，并对这些桶中的有限内容进行计算的方法
+
+#### 定义窗口算子
+* 窗口算子可以用在键值分区或非键值分区的数据流上。用于键值分区窗口的算子可以并行计算，而非键值分区窗口只能单线程处理
+* 新建一个窗口算子需要指定两个窗口组件：
+    1. 一个用于决定输入流中的元素该如何划分的窗口分配器（window assigner）。窗口分配器会产生一个 WindowedStream（如果用在非键值分区的 DataStream 上则是 AllWindowedStream）
+    2. 一个作用于 WindowedStream（或 AllWindowedStream）上，用于处理分配到窗口中元素的窗口函数
+
+#### 内置窗口分配器
+* 基于时间的窗口分配器会根据元素事件时间的时间戳或当前处理时间将其分配到一个或多个窗口。每个时间窗口都有一个开始时间戳和一个结束时间戳
+* 所有内置的窗口分配器都提供了一个默认的触发器，一旦（处理或事件）时间超过了窗口的结束时间就会触发窗口计算
+* 窗口会随着系统首次为其分配元素而创建，Flink 永远不会对空窗口执行计算
+* Flink 内置窗口分配器所创建的窗口类型为 TimeWindow。该窗口类型实际上表示两个时间戳之间的时间区间（左闭右开）。它对外提供了获取窗口边界、检查窗口是否相交以及合并重叠窗口等方法
+* **滚动窗口**
+    - DataStream API 针对事件时间和处理时间的滚动窗口分别提供了对应的分配器——TumblingEventTimeWindows 和TumblingProcessingTimeWindows
+    - 滚动窗口分配器只接收一个参数：以时间单元表示的窗口大小。它可以利用分配器的 of(Time size) 方法指定。时间间隔允许以毫秒、秒、分钟、小时或天数来表示
+
+```scala
+val sensorData: DataStream[SensorReading] = ...
+val avgTemp = sensorData
+			.keyBy(_.id)
+			// 将读数按照 1 秒事件时间窗口分组
+			.window(TumblingEventTimeWindows.of(Time.seconds(1)))
+			.process(new TemperatureAverager)
+```
+
+* **滑动窗口**
+    - 需要指定窗口大小以及用于定义新窗口开始频率的滑动间隔
+    - 如果滑动间隔小于窗口大小，则窗口会出现重叠，此时元素会被分配给多个窗口；如果滑动间隔大于窗口大小，则一些元素可能不会分配给任何窗口，因此可能会被直接丢弃
+
+```scala
+// 事件时间滑动窗口分配器
+val slidingAvgTemp = sensorData
+					.keyBy(_.id)
+					// 每隔 15 分钟创建 1 小时的事件时间窗口
+					.window(SlidingEventTimeWindows.of(Time.hour(1), Time.minutes(15)))
+					.process(new TemperatureAverager)
+```
+
+* **会话窗口**
+    - 会话窗口将元素放入长度可变且不重叠的窗口中。会话窗口的边界由非活动间隔，即持续没有收到记录的时间间隔来定义
+    - 由于会话窗口的开始和结束都取决于接收的元素，所以窗口分配器无法实时将所有元素分配到正确的窗口。事实上，SessionWindows 分配器会将每个到来的元素映射到一个它自己的窗口中。该窗口的起始时间是元素的时间戳，大小为会话间隔。随后分配器会将所有范围存在重叠的窗口合并
+
+```scala
+// 事件时间会话窗口分配器
+val sessionWindows = sensorData
+					.keyBy(_.id)
+					// 创建 15 分钟间隔的事件时间会话窗口
+			.window(EventTimeSessionWindows.withGap(Time.minutes(15)))
+					process(...)
+```
+
+#### 在窗口上应用函数
+* 可用于窗口的函数类型有两种：
+    1. 增量聚合函数。它的应用场景是窗口内以状态形式存储某个值且需要根据每个加入窗口的元素对该值进行更新。此类函数通常会十分节省空间且最终会将聚合值作为单个结果发送出去，如 ReduceFunction 和 AggregateFunction
+    2. 全量窗口函数。它会收集窗口内的所有元素，并在执行计算时对它们进行遍历。虽然全量窗口函数通常需要占用更多空间，但它和增量聚合函数相比，支持更复杂的逻辑，如 ProcessWindowFunction
+* **ReduceFunction**
+    - ReduceFunction 接收两个同类型的值并将它们组合生成一个类型不变的值。当被用在窗口化数据流上时，ReduceFunction 会对分配给窗口的元素进行增量聚合。窗口只需要存储当前聚合结果，一个和 ReduceFunction 的输入及输出类型都相同的值。每当收到一个新元素，算子都会以该元素和从窗口状态取出的当前聚合值为参数调用 ReduceFunction，随后会用 ReduceFunction 的结果替换窗口状态
+
+```scala
+val minTempPerWindow: DataStream[(String, Double)] = sensorData
+	.map(r => (r.id, r.temperature))
+	.keyBy(_._1)
+	.timeWindow(Time.seconds(15))
+	.reduce((r1, r2) => (r1._1, r1._2.min(r2._2)))
+```
+
+* **AggregateFunction**
+    - 和 ReduceFunction 类似，AggregateFunction 也会以增量方式应用于窗口内的元素，其状态也只有一个值
+    - 下列代码展示了如何用 AggregateFunction 计算每个窗口内传感器读数的平均温度。其累加器负责维护不断变化的温度总和及数量，getResult() 方法用来计算平均值
+
+```scala
+val avgTempPerWindow: DataStream[(String, Double)] = sensorData
+	.map(r => (r.id, r.temperature))
+	.keyBy(_._1)
+	.timeWindow(Time.seconds(15))
+	.aggregate(new AvgTempFunction)
+
+// 用于计算每个传感器平均温度的 AggregateFunction
+// 累加器用于保存温度总和及事件数量
+class AvgTempFunction extends AggregateFunction[(String, Double), (String, Double, Int), (String, Double)]{
+	override def createAccumulator() = {
+		("", 0.0, 0)
+	}
+	override def add(in: (String, Double), acc: (String, Double, Int)) = {
+		(in._1, in._2 + acc._2, 1 + acc._3)
+	}
+	override def getResult(acc: (String, Double, Int)) = {
+		(acc._1, acc._2 / acc._3)
+	}
+	override def merge(acc1: (String, Double, Int), acc2: (String, Double, Int)) = {
+		(acc1._1, acc1._2 + acc2._2, acc1._3 + acc2._3)
+	}
+}
+```
+
+* **ProcessWindowFunction**
+    - ReduceFunction 和 AggregateFunction 都是对分配到窗口的事件进行增量计算。然而有些时候我们需要访问窗口内的所有元素来执行一些更加复杂的计算，例如计算窗口内数据的中值或出现频率最高的值。
+    - ProcessWindowFunction 可以对窗口内容执行任意计算
+    - process() 方法在被调用时会传入窗口的键值、一个用于访问窗口内元素的 Iterator 以及一个用于发出结果的 Collector。此外，该方法和其他处理方法一样都有一个 Context 参数。ProcessWindowFunction 的 Context 对象可以访问窗口的元数据，当前处理时间和水位线，用于管理单个窗口和每个键值全局状态的状态存储以及用于发出数据的副输出
+    - ProcessWindowFunction 中的 Context 对象具有一些特有功能，即访问单个窗口的状态及每个键值的全局状态。
+        - 其中单个窗口的状态指的是当前正在计算的窗口实例的状态，而全局状态指的是不属于任何一个窗口的键值分区状态。
+        - 单个窗口状态用于维护同一窗口内多次调用 process() 方法所需共享的信息，这种多次调用可能是由于配置了允许数据迟到或使用了自定义触发器
+        - 使用了单个窗口状态的 ProcessWindowFunction 需要实现 clear() 方法，在窗口清除前清理仅供当前窗口使用的状态
+        - 全局状态可用于在键值相同的多个窗口之间共享信息
+    - 在系统内部，**由 ProcessWindowFunction 处理的窗口会将已分配的事件存储在 ListState 中**。通过将所有事件收集起来且提供对于窗口元数据及其他一些特性的访问和使用，ProcessWindowFunction 的应用场景比 ReduceFunction 和 AggregateFunction 更加广泛。但和执行增量聚合的窗口相比，**收集全部事件的窗口其状态要大得多**
+
+```scala
+public abstract class ProcessWindowFunction<IN, OUT, KEY, W extends Window> extends AbstractRichFunction {
+	// 对窗口执行计算
+	void process(KEY key, Context ctx, Iterable<IN> vals, Collector<OUT> out) throws Exception;
+	// 在窗口清除时删除自定义的单个窗口状态
+	public void clear(Context ctx) throws Exception {}
+	// 保存窗口元数据的上下文
+	public abstract class Context implements Serializable {
+		// 返回窗口的元数据
+		public abstract W window();
+		// 返回当前处理时间
+		public abstract long currentProcessingTime();
+		// 返回当前事件时间水位线
+		public abstract long currentWatermark();
+		// 用于单个窗口状态的访问器
+		public abstract KeyedStateStore windowState();
+		// 用于每个键值全局状态的访问器
+		public abstract KeyedStateStore globalState();
+		// 向 OutputTag 标识的副输出发送记录
+		public abstract <X> void output(OutputTag<X> outputTag, X value);
+	}
+}
+```
+
+* **增量聚合与 ProcessWindowFunction**
+    - ProcessWindowFunction 和增量聚合函数相比通常需要在状态中保存更多数据
+    - 如果可用增量聚合表示逻辑但还需要访问窗口元数据，则可以将 ReduceFunction 或 AggregateFunction 与功能更强的 ProcessWindowFunction 组合使用
+    - 可以对分配给窗口的元素立即执行聚合，随后当窗口触发器触发时，再将聚合后的结果传给 ProcessWindowFunction。这样传递给 ProcessWindowFunction.process() 方法的 Iterable 参数内将只有一个值，即增量聚合的结果
+    - DataStream API 中，实现上述过程的途径是将 ProcessWindowFunction 作为 reduce() 或 Aggregate() 方法的第二个参数
+
+```scala
+val minMaxTempPerWindow: DataStream[MinMaxTemp] = sensorData
+	.map(r => (r.id, r.temperature, r.temperature))
+	.keyBy(_._1)
+	.timeWindow(Time.seconds(5))
+	.reduce(
+		// 增量计算最低和最高温度
+		(r1: (String, Double, Double), r2: (String, Double, Double)) => {
+			(r1._1, r1._2.min(r2._2), r1._3.max(r2._3))
+		},
+		// 在 ProcessWindowFunction 中计算最终结果
+		new AssignWindowEndProcessFunction()
+	)
+```
+
+#### 自定义窗口算子
+* DataStream API 对外暴露了自定义窗口算子的接口和方法，你可以实现自己的**分配器（assigner）**、**触发器（trigger）**以及**移除器（evictor）**
+* 当一个元素进入窗口算子时会被移交给 WindowAssigner，该分配器决定了元素应该被放入哪几个窗口中。如果目标窗口不存在，则会创建它
+* 如果为窗口算子配置的是增量聚合函数，那么新加入的元素会立即执行聚合，其结果会作为窗口内容存储。如果窗口算子没有配置增量聚合函数，那么新加入的元素会附加到一个用于存储所有窗口分配元素的 ListState 上
+* 每个元素在加入窗口后还会被传递至该窗口的触发器。**触发器定义了窗口何时准备好执行计算，何时需要清除自身及保存的内容**。触发器可以根据已分配的元素或注册的计时器（类似处理函数）来决定在某些特定时刻执行计算或清除窗口中的内容
+* 触发器成功触发后的行为取决于窗口算子所配置的函数。
+    - 如果算子只是**配置了一个增量聚合函数**，就会发出当前聚合结果。
+    - 如果算子只**包含一个全量窗口函数**，那么该函数将一次性作用于窗口内的所有元素上，之后便会发出结果。
+    - 如果算子**同时拥有一个增量聚合函数和一个全量窗口函数**，那么后者将作用于前者产生的聚合值上，之后便会发出结果
+* 移除器作为一个可选组件，允许在 ProcessWindowFunction 调用之前或之后引入。它可以用来**从窗口中删除已经收集的元素**。由于**需要遍历所有元素**，移除器只有在未指定增量聚合函数的时候才能使用
+
+##### 窗口的生命周期
+* 窗口会在 WindowAssigner 首次向它分配元素时创建。因此，**每个窗口至少会有一个元素**
+* 窗口内的状态由以下几部分组成：
+    - 窗口内容：包含分配给窗口的元素，或当窗口算子配置了 ReduceFunction 或 AggregateFunction 时增量聚合所得到的结果
+    - 窗口对象：WindowAssigner 会返回零个、一个或多个窗口对象。窗口算子会根据返回的对象对元素进行分组。因此窗口对象中保存着用于区分窗口的信息。每个窗口对象都有一个结束时间戳，它**定义了可以安全删除窗口及其状态的时间点**
+    - 触发器计时器：可以在触发器中注册计时器，用于在将来某个时间点触发回调（如对窗口进行计算或清理其内容）。这些计时器由窗口算子负责维护
+    - 触发器中的自定义状态
+* 窗口算子会在窗口结束时间（由窗口对象中的结束时间戳定义）到达时**删除窗口**。该时间是处理时间还是事件时间语义取决于 WindowAssigner.isEventTime() 方法的返回值
+* 当窗口需要删除时，窗口算子会自动清除窗口内容并丢弃窗口对象
+
+> 自定义触发器状态和触发器计时器不会被清除，因为这些状态对于窗口算子而言是不可见的。所以为了避免状态泄露，触发器需要在 Trigger.clear() 方法中清除自身所有状态
+
+##### 窗口分配器
+* WindowAssigner 用于决定将到来的元素分配给哪些窗口。每个元素可以被加到零个、一个或多个窗口中。
+* WindowAssigner 接口：
+
+```scala
+public abstract class WindowAssigner<T, W extends Window> implements Serializable {
+	// 返回元素分配的目标窗口集合
+	public abstract Collection<W> assignWindows(T element, long timestamp, WindowAssignerContext context);
+	// 返回 WindowAssigner 的默认触发器
+	public abstract Trigger<T, W> getDefaultTrigger(StreamExecutionEnvironment env);
+	// 返回 WindowAssigner 中窗口的 TypeSerializer
+	public abstract TypeSerializer<W> getWindowSerializer(ExecutionConfig executionConfig);
+	// 表明此分配器是否创建基于事件时间的窗口
+	public abstract boolean isEventTime();
+	// 用于访问当前处理时间的上下文
+	public abstract static class WindowAssignerContext {
+		// 返回当前处理时间
+		public abstract long getCurrentProcessingTime();
+	}
+}
+```
+
+##### 触发器
+* 触发器用于定义何时对窗口进行计算并发出结果
+* 触发条件可以是时间，也可以是某些特定的数据条件，如元素数量或某些观测到的元素值
+* 每次调用触发器都会生成一个 TriggerResult，它用于决定窗口接下来的行为，可以是以下值之一：
+    - CONTINUE：什么都不做
+    - FIRE：如果窗口算子配置了 ProcessWindowFunction，就会调用该函数并发出结果；如果窗口只包含一个增量聚合函数，则直接发出当前聚合结果。窗口状态不会发生任何变化
+    - PURGE：完全清除窗口内容，并删除窗口自身及其元数据。同时，调用 ProcessWindowFunction.clear() 方法来清理那些自定义的单个窗口状态
+    - FIRE_AND_PURGE：先进行窗口计算（FIRE），随后删除所有状态及元数据（PURGE）
+* Trigger 接口：
+
+```scala
+public abstract class Trigger<T, W extends Window> implements Serializable {
+	// 每当有元素添加到窗口时都会调用
+	TriggerResult onElement(T element, long timestamp, W window, TriggerContext ctx);
+	// 在处理时间计时器触发时调用
+	public abstract TriggerResult onProcessingTime(long timestamp, W window, TriggerContext ctx);
+	//在事件时间计时器触发时调用
+	public abstract TriggerResult onEventTime(long timestamp, W window, TriggerContext ctx);
+	// 如果触发器支持合并触发器状态则返回 true
+	public boolean canMerge();
+	// 当多个窗口合并为一个窗口且需要合并触发器状态时调用
+	public void onMerge(W window, OnMergeContext ctx);
+	// 在触发器中清除那些为给定窗口保存的状态，该方法会在清除窗口时调用
+	public abstract void clear(W window, TriggerContext ctx);
+}
+
+// 用于触发器中方法的上下文对象，使其可以注册计时器回调并处理状态
+public interface TriggerContext {
+	// 返回当前处理时间
+	long getCurrentProcessingTime();
+	// 返回当前水位线时间
+	long getCurrentWatermark();
+	// 注册一个处理时间计时器
+	void registerProcessingTimeTimer(long time);
+	// 注册一个事件时间计时器
+	void registerEventTimeTimer(long time);
+	// 删除一个处理时间计时器
+	void deleteProcessingTimeTimer(long time);
+	// 删除一个事件时间计时器
+	void deleteEventTimeTimer(long time);
+	// 获取一个作用域为触发器键值和当前窗口的状态对象
+	<S extends State> S getPartitionedState(StateDescriptor<S, ?> stateDescriptor);
+}
+
+// 用于 Trigger.onMerge() 方法的 TriggerContext 扩展
+public interface OnMergeContext extends TriggerContext {
+	// 合并触发器中的单个窗口状态，目标状态自身需要合并
+	void mergePartitionedState(StateDescriptor<S, ?> stateDescriptor);
+}
+```
+
+* 当在触发器中使用了单个窗口状态时，需要保证它们会随着窗口删除而被正确地清理，否则窗口算子的状态会越积越多，最终可能导致你的应用在某个时间出现故障。为了在删除窗口时彻底清理状态，触发器的 clear() 方法需要删除全部自定义的单个窗口状态并使用 TriggerContext 对象删除所有处理时间和事件时间计时器。由于在删除窗口后不会调用计时器回调方法，所以无法在其中清理状态
+
+##### 移除器
+* Evictor 接口：
+
+```scala
+public interface Evictor<T, W extends Window> extends Serializable {
+	// 选择性地移除元素。在窗口函数之前调用
+	void evictBefore(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+	// 选择性地移除元素。在窗口函数之后调用
+	void evictAfter(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+	// 用于移除器内方法的上下文对象
+	interface EvictorContext {
+		// 返回当前处理时间
+		long getCurrentProcessingTime();
+		// 返回当前事件时间水位线
+		long getCurrentWatermark();
+	}
+}
+```
+
+* 移除器常用于 GlobalWindow，它支持清理部分窗口内容而不必完全清除整个窗口状态
+
+> **GlobalWindows 分配器**
+> GlobalWindows 分配器会将所有元素映射到一个全局窗口中。它默认的触发器是 NeverTrigger，该触发器永远不会触发。因此 GlobalWindow 分配器需要一个自定义的触发器，可能还需要一个移除器来有选择性地将元素从窗口状态中删除
+
+
+
+
+### 基于时间的双流 Join
+* Flink DataStream API 中内置有两个可以根据时间条件对数据流进行 Join 的算子：基于间隔的 Join 和基于窗口的 Join
+
+#### 基于间隔的 Join
+* 基于间隔的 Join 会对两条流中拥有相同键值以及彼此之间时间戳不超过某一指定间隔的事件进行 Join
+* Join 成功的事件对会发送给 ProcessJoinFunction。下界和上界分别由负时间间隔和正时间间隔来定义，例如 between(Time.hour(-1), Time.minute(15))。在满足下界值小于上界值的前提下，可以任意对它们赋值
+* 基于间隔的 Join 需要同时对双流的记录进行缓冲
+
+#### 基于窗口的 Join
+* 用到 Flink 中的窗口机制。其原理是将两条输入流中的元素分配到公共窗口中并在窗口完成时进行 Join
+* 两条输入流都会根据各自的键值属性进行分区，公共窗口分配器会将二者的事件映射到公共窗口内。当窗口的计时器触发时，算子会遍历两个输入中元素的每个组合（叉乘积）去调用 JoinFunction。由于两条流中的事件会被映射到同一个窗口中，因此该过程中的触发器和移除器与常规窗口算子中的完全相同
+
+
+
+
+### 处理迟到数据
+* 迟到是指元素到达算子后，它本应参与贡献的计算已经执行完毕。在事件时间窗口算子的环境下，如果事件到达算子时窗口分配器为其分配的窗口已经因为算子水位线超过了它的结束时间而计算完毕，那么该事件就被认为是迟到的
+* DataStream API 应对迟到数据策略：
+    - 简单地将其丢弃
+    - 将迟到事件重定向到单独的数据流中
+    - 根据迟到事件更新并发出计算结果
+
+#### 丢弃迟到事件
+* 事件时间窗口的默认行为
+
+#### 重定向迟到事件
+* 利用副输出将迟到事件重定向到另一个 DataStream，就可以对它们进行后续处理或利用常规的数据汇函数将其写出。迟到数据可通过定期的回填操作集成到流式应用的结果中
+* 处理函数可通过比较事件时间的时间戳和当前水位线来识别迟到事件，并使用常规的副输出 API 将其发出
+
+#### 基于迟到事件更新结果
+* 策略：对不完整的结果进行重新计算并发出更新
+* 在使用事件时间窗口时，可以制定一个名为延迟容忍度的额外时间段。配置了该属性的窗口算子在水位线超过窗口的结束时间戳之后不会立即删除窗口，而是会将窗口继续保留该延迟容忍度的事件。在这段额外时间内到达的迟到元素会像按时到达的元素一样交给触发器处理。当水位线超过了窗口结束时间加延迟容忍度的间隔，窗口才会被最终删除，伺候所有的迟到元素都将直接丢弃
+
+
+
+
+## 6. 有状态算子和应用
+* 由于数据会随时间以流式到来，大多数复杂一些的操作都需要存储部分数据或中间结果
+* 很多 Flink 内置的 DataStream 算子、数据源以及数据汇都是有状态的，它们需要对数据记录进行缓冲或者对中间结果及元数据加以维护
+* 状态化流处理会在故障恢复、内存管理以及流式应用维护等很多方面对流处理引擎产生影响
+
+### 实现有状态函数
+#### 在 RuntimeContext 中声明键值分区状态
+* Flink 为键值分区状态提供了很多原语。状态原语定义了单个键值对应的状态结构。它的选择取决于函数和状态的交互方式。同时，由于每个状态后端都为这些原语提供了自己的实现，该选择还会影响函数的性能。
+* Flink 目前支持以下状态原语：
+    - ValueState[T]：用于保存类型为 T 的单个值
+    - ListState[T]：用于保存类型为 T 的元素列表
+    - MapState[K, V]：用于保存一组键到值的映射
+    - ReducingState[T]：提供了和 ListState[T] 相同的方法，但它的 ReducingState.add(value: T) 方法会立刻返回一个使用 ReduceFunction 聚合后的值
+    - AggregatingState[I, O]: 和ReducingState 行为类似，但它使用了更加通用的 AggregateFunction 来聚合内部的值
+
+#### 通过 ListCheckpointed 接口实现算子列表状态
+* 在函数中使用算子列表状态，需要实现 ListCheckpointed 接口。该接口不像 ValueState 或 ListState那样直接在状态后端注册，而是需要将算子状态实现为成员变量并通过接口提供的回调函数与状态后端进行交互
+* ListCheckpointed 接口提供了两个方法：
+    - snapshotState()：会在 Flink 触发为有状态函数生成检查点时调用
+    - restoreState()：会在初始化函数状态时调用，该过程可能发生在作业启动或故障恢复的情况下
+
+##### 使用联结的广播状态
+* 流式应用的一个常见需求是将相同信息发送到函数的所有并行实例上，并将它们作为可恢复的状态进行维护。在 Flink 中，这种状态称为广播状态
+* 在两条数据流上应用带有广播状态的函数需要三个步骤：
+    - 调用 DataStream.broadcast() 方法创建一个 BroadcastStream 并提供一个或多个 MapStateDescriptor 对象。每个描述符都会为将来用于 BroadcastStream 的函数定义一个单独的广播状态
+    - 将 BroadcastStream 和一个 DataStream 或 KeyedStream 联结起来。必须将 BroadcastStream 作为参数传给 connect() 方法
+    - 在联结后的数据流上应用一个函数。根据另一条流是否已经按键值分区，该函数可能是 KeyedBroadcastProcessFunction 或 BroadcastProcessFunction
+
+#### 使用 CheckpointedFunction 接口
+* CheckpointedFunction 是用于指定有状态函数的最底层接口。它提供了用于注册和维护键值分区状态以算子状态的钩子函数（hook），同时也是唯一支持使用算子联合列表状态的接口
+* CheckpointedFunction 接口定义了两个方法：
+    - initializeState()：会在创建 CheckpointedFunction 的并行实例时被调用。触发时机是应用启动或由于故障而重启任务
+    - snapshotState()：会在生成检查点之前调用。目的是确保检查点开始之前所有状态对象都已更新完毕。该方法还可以结合 CheckpointedListener 接口使用，在检查点同步阶段将数据一致性地写入外部存储中
+
+> 我们在注册任意一个状态时，都要提供一个函数范围内唯一的名称。在函数注册状态过程中，状态存储首先会利用给定名称检查状态后端中是否存在一个为当前函数注册过的同名状态，并尝试用它对状态进行初始化。如果是重启任务（无论由于故障还是从保存点恢复）的情况，Flink 就会用保存的数据初始化状态；如果应用不是从检查点或保存点启动，那状态就会初始化为空
+
+#### 接收检查点完成通知
+* **频繁地同步是分布式系统产生性能瓶颈的主要原因**。Flink 的设计旨在减少同步点的数量，其内部的检查点是基于和数据一起流动的分隔符来实现的，因此可以避免对应用所有算子实施全局同步
+* 得益于该检查点机制，Flink 有着非常好的性能表现。但也意味着除了生成检查点的几个逻辑时间点外，应用程序的状态无法做到强一致。了解检查点的完成情况非常重要
+* 在所有算子任务都成功将其状态写入检查点存储后，整体的检查点才算创建成功。因此，只有 JobManager 才能对此作出判断。算子为了感知检查点创建成功，可以实现 CheckpointedListener 接口。该接口提供的 notifyCheckpointComplete(long checkpointId) 方法，会在 JobManager 将检查点注册为已完成时被调用
+
+
+
+
+### 为有状态的应用开启故障恢复
+* Flink 为有状态的应用创建一致性检查点的机制：在所有算子都处理到应用输入流的某一特定位置时，为全部内置或用户定义的有状态函数基于该时间点创建一个状态快照。为了支持应用容错，JobManager 会以固定间隔创建检查点
+* 检查点间隔是影响常规处理期间创建检查点的开销以及故障恢复所需时间的一个重要参数，较短的间隔会为常规处理带来较大的开销，但由于恢复时要重新处理的数据量较小，所以恢复速度会更快
+* Flink 还为检查点行为提供了其他一些可供调节的配置选项，例如，一致性保障（精确一次或至少一次）的选择，可同时生成的检查点的数目以及用来取消长时间运行检查点的超时时间，以及多个和状态后端相关的选项
+
+
+
+
+### 确保有状态应用的可维护性
+* 在应用运行较长一段时间后，其状态就会变得成本十分昂贵，甚至无法重新计算。同时，我们也需要对长时间运行的应用进行一些维护。例如，修复 Bug，添加、删除或调整功能，或针对不同的数据到来速率算子的并行度
+* Flink 利用保存点机制来对应用及其状态进行维护，但它需要初始版本应用的全部有状态算子都指定好两个参数，才可以在未来正常工作。这两个参数是**算子唯一标识**和**最大并行度**
+
+> 算子的唯一标识和最大并行度会被固化到保存点中，不可更改。如果新应用中这两个参数发生了变化，则无法从之前生成的保存点启动。
+> 一旦你修改了算子标识或最大并行度则无法从保存点启动应用，只能选择丢弃状态从头开始运行
+
+#### 指定算子唯一标识
+* 为应用中的每个算子指定唯一标识，该标识会作为元数据和算子的实际状态一起写入保存点。当应用从保存点启动时，会利用这些标识将保存点中的状态映射到目标应用对应的算子。只有当目标应用的算子标识和保存点中的算子标识相同时，状态才能顺利恢复
+* 如果没有为有状态应用的算子显式指定标识，那么在更新应用时就会受到诸多限制
+
+#### 为使用键值分区状态的算子定义最大并行度
+* 算子的最大并行度参数定义了算子在对键值状态进行分割时，所能用到的键值组数量。该数量限制了键值分区状态可以被扩展到的最大并行任务数
+* 可以通过 StreamExecutionEnvironment 为应用的所有算子设置最大并行度或利用算子的 setMaxParallelism() 方法为每个算子单独设置
+
+
+
+
+### 有状态应用的性能及鲁棒性
+* 算子和状态的交互会对应用的鲁棒性及性能产生一定影响。这些影响的原因是多方面的，例如，状态后端的选择（影响本地状态如何存储和执行快照），检查点算法的配置以及应用状态大小等
+
+#### 选择状态后端
+* 状态后端负责存储每个状态实例的本地状态，并在生成检查点时将它们写入远程持久化存储。由于本地状态的维护及写入检查点的方式多种多样，所以状态后端被设计为“可插拔的”，两个应用可以选择不同的状态后端实现来维护其状态
+* 状态后端的选择会影响有状态应用的鲁棒性及性能
+* 每一种状态后端都为不同的状态原语（如 ValueState、ListState 和 MapState）提供了不同的实现
+* Flink 提供了三种状态后端：
+    - MemoryStateBackend：将状态以常规对象的方式存储在 TaskManager 进程的 JVM 堆里。如果某个任务实例的状态变得很大，那么它所在的 JVM 连同所有运行在该 JVM 之上的任务实例都可能由于 OutOfMemoryError 而终止。此外，该方法可能由于堆中放置了过多常驻内存的对象而引发垃圾回收停顿问题。在生成检查点时，MemoryStateBackend 会将状态发送至 JobManager 并保存到它的堆内存中。因此 JobManager 的内存需要装得下应用的全部状态。因为内存具有易失性，所以一旦 JobManager 出现故障，状态就会丢失。由于存在这些限制，**建议仅将 MemoryStateBackend 用于开发和调试**
+    - FsStateBackend：和MemoryStateBackend 一样，将本地状态保存在 TaskManager 的 JVM 堆内。但它不会在创建检查点时将状态存到 JobManager 的易失内存中，而是会将它们**写入远程持久化文件系统**。因此，FsStateBackend 既让本地访问享有内存的速度，又可以支持故障容错。但它同样会受到 TaskManager 内存大小的限制，并且也可能导致垃圾回收停顿问题
+    - RocksDBStateBackend：会把全部状态存到本地 RocksDB 实例中。RocksDB 是一个嵌入式键值存储（key-value store），它可以将数据保存到**本地磁盘**上。为了从 RocksDB 中读写数据，系统需要对数据进行序列化和反序列化。RocksDBStateBackend 同样会将状态以检查点形式写入远程持久化文件系统。因为它能够将数据写入磁盘，且支持增量检查点，所以对于状态非常大的应用是一个很好的选择。然而，对于磁盘的读写和序列化反序列化对象的开销使得它和在内存中维护状态比起来，读写性能会偏低
+
+```scala
+// 为应用配置 RocksDBStateBackend
+val env = StreamExecutionEnvironment.getExecutionEnvironment
+val checkpointPath: String = ???
+// 远程文件系统检查点配置路径
+val backend = new RocksDBStateBackend(checkpointPath)
+// 配置状态后端
+env.setStateBackend(backend)
+```
+
+#### 选择状态原语
+* 有状态算子（无论是内置的还是用户自定义的）的性能取决于多个方面，包括状态的数据类型，应用的状态后端以及所选的状态原语
+* 对于在读写状态时涉及对象序列化和反序列化的状态后端，状态原语的选择将对应用性能产生决定性的影响
+* ValueState 需要在更新和访问时分别进行完整的序列化和反序列化。在构造用于数据访问的 Iterable 对象之前，RocksDBStateBackend 的 ListState 需要将它所有的列表条目反序列化。但向 ListState 中添加一个值的操作会相对轻量级一些，因为它只会序列化新添加的值。RocksDBStateBackend 的 MapState 允许按照每个键对其数据值进行读写，并且只有那些读写的键和数据值才需要进行序列化。在遍历 MapState 的条目集时，状态后端会从 RocksDB 中预取出序列化好的所有条目，并只有在实际访问某个键或数据值的时候才会将其反序列化
+
+#### 防止状态泄露
+* 流式应用经常会被设计成需要长年累月地连续运行。应用状态如果不断增加，总有一天会变得过大并“杀死”应用。为了防止应用资源逐渐耗尽，关键要控制算子状态大小。由于对状态的处理会直接影响算子语义，所以 Flink 无法通过自动清理状态来释放资源。所有有状态算子都要控制自身状态大小，确保它们不会无限制增长
+* 导致状态增长的一个常见原因是键值状态的键值域不断发生变化。在该场景下，有状态函数所接收记录的键值只有一段特定时间的活跃期，此后就再也不会收到。随着键值空间的不断变化，状态中那些过期的旧键值会变得毫无价值。该问题的解决方案是从状态中删除那些过期的键值。然而，具有键值分区状态的函数只有在收到某键值的记录时才能访问该键值的状态。很多情况下，函数不会知道某条记录是否是该键值所对应的最后一条。因此它根本无法准确移除某一键值的状态
+* 在设计和实现有状态算子的时候，需要把应用需求和输入数据的属性（如键值域）都考虑在内。如果你的应用需要用到键值域不断变化的键值分区状态，那么必须要确保能够对那些无用的状态进行清除。该工作可以通过注册针对未来某个时间点的计时器来完成。和状态类似，计时器也会注册在当前活动键值的上下文中。计时器在触发时，会调用回调方法并加载计时器键值的上下文。因此在回调方法内可以获得当前键值状态的完整访问权限并将其清除
+
+
+
+
+### 更新有状态应用
+* 很多时候我们需要对一个长时间运行的有状态的流式应用进行 Bug 修复或业务逻辑调整。这往往要求我们在不丢失状态的前提下对当前运行的应用进行版本更新
+* 当应用从保存点启动时，它的算子会使用算子标识和状态名称从保存点中查找对应的状态进行初始化。从保存点兼容性的角度看，应用可以通过以下三种方式进行更新：
+    1. 在不对已有状态进行更改或删除的前提下更新或扩展应用逻辑，包括向应用中添加有状态或无状态的算子
+    2. 从应用中移除某个状态
+    3. 通过改变状态原语或数据类型来修改已有算子的状态
+
+#### 保持现有状态更新应用
+* 如果应用在更新时不会删除或改变已有状态，那么它一定是保存点兼容的，并且能够从旧版本的保存点启动
+* 如果你向应用中添加了新的状态算子或已有算子增加了状态，那么在应用从保存点启动时，这些状态都会被初始化为空
+
+#### 从应用中删除状态
+* 删除操作针对的可以是一个完整的有状态算子，也可以是函数中的某个状态。当新版本的应用从一个旧版本的保存点启动时，保存点中的部分状态将无法映射到重启的应用中。如果算子的唯一标识或状态名称发生了改变，也会出现这种情况
+* 为了避免保存点中的状态丢失，Flink 在默认情况下不允许那些无法将保存点中的状态全部恢复的应用启动，可以禁用这一安全检查。
+
+#### 修改算子的状态
+* 两种方法对状态进行修改：
+    - 通过更改状态的数据类型，例如将 ValueState[Int] 改为 ValueState[Double]
+    - 通过更改状态原语类型，例如将 ValueState[List[String]] 改为 ListState[String]
+
+#### 可查询式状态
+* 很多处理应用需要将它们的结果与其他应用分享。常见的分享模式是先把结果写入数据库或键值存储中，再由其他应用从这些存储中获取结果
+* 为了解决以往需要外部数据存储才能分享数据的问题，Apache Flink 提供了可查询式状态功能。在 Flink 中，任何键值分区状态都可以作为可查询式状态暴露给外部应用，就像一个只读的键值存储一样。有状态的流式应用可以按照正常流程处理事件，并在可查询状态中对其中间或最终结果进行存储和更新。外部应用可以在流式应用运行过程中访问某一键值的状态
+* 可查询式状态无法应对所有需要外部数据存储的场景。原因之一：它只有在应用运行过程中才可以访问。如果应用正在因为错误而重启、正在进行扩缩容或正在迁移至其他集群，那么可查询式状态将无法访问
+
+#### 可查询式状态服务的架构及启动方式
+* Flink 的可查询式状态服务包含三个进程：
+    - QueryableStateClient 用于外部系统提交查询及获取结果
+    - QueryableStateClientProxy：用于接收并响应客户端请求。该客户端代理需要在每个 TaskManager 上面都运行一个实例。由于键值分区状态会分布在算子所有并行实例上面，所以代理需要识别请求键值对应的状态所在的 TaskManager。该信息可以从负责键值组分配的 JobManager 上面获得，代理在一次请求过后就会将它们缓存下来。客户端代理从各自 TaskManager 的状态服务器上取得状态，然后把结果返给客户端
+    - QueryableStateServer：用于处理客户端代理的请求。状态服务器同样需要运行在每个 TaskManager 上面。它会根据查询的键值从本地状态后端取得状态，然后将其返回给提交请求的客户端代理
+
+![可查询式状态服务架构](https://cdn.jsdelivr.net/gh/qtxsnwwb/image-hosting@master/20210522/可查询式状态服务架构.2xefargn6ji0.png)
+
+* 为了在 Flink 设置中启用可查询式状态服务（即在 TaskManager 中启动客户端代理和服务器线程），需要将 *flink-queryable-state-runtime* JAR 文件放到 TaskManager 进程的 Classpath 中。为此，可以直接将 JAR 文件从 Flink 安装路径的 *./opt* 目录拷贝到 *./lib* 目录中。如果 Classpath 中存在该 JAR 文件，可查询式状态的线程就会自动启动，以响应客户端请求
+* 正确配置后，会在 TaskManager 的日志中看到以下信息：
+
+```
+Started the Queryable State Proxy Server @ ...
+```
+
+* 客户端代理和服务器所使用的端口以及一些额外的参数可以在 *./conf/flink-conf.yaml* 文件中配置
+
+#### 对外暴露可查询式状态
+* 实现一个支持可查询式状态的流式应用非常简单。要做的就是定义一个具有键值分区状态的函数，然后在获取状态引用之前调用 StateDescriptor 的 setQueryable(String) 方法。这样，目标状态就变为可查询的了
+
+```scala
+// 将键值分区状态设置为可查询的
+override def open(parameters: Configuration): Unit = {
+	// 创建状态描述符
+	val lastTempDescriptor = new ValueStateDescriptor[Double]("lastTemp", classOf[Double])
+	// 启用可查询式状态并设置其外部标识符
+	lastTempDescriptor.setQueryable("lastTemperature")
+	// 获得状态引用
+	lastTempState = getRuntimeContext.getState[Double](lastTempDescriptor)
+}
+```
+
+#### 从外部系统查询状态
+* 所有基于 JVM 的应用都可以使用 QueryableStateClient 对运行中 Flink 的可查询式状态进行查询。这个类由 *flink-queryable-state-client-java* 依赖提供
+* 为了初始化 QueryableStateClient，需要提供任意一个 TaskManager 的主机名以及其上可查询式状态客户端代理的监听端口。客户端代理的默认监听端口是 9067，可以在 *./conf/flink-conf.yaml* 文件中对它进行配置：
+
+```
+val client: QueryableStateClient = new QueryableStateClient(tmHostname, proxyPort)
+```
+
+* 在得到一个状态客户端对象之后，就可以调用它的 getKvState() 方法来查询应用的状态。该方法需要接收几个参数，包括：当前运行应用的 JobID，状态标识符，所需状态的键值，键值的 TypeInformation 以及可查询式状态的 StateDescriptor。其中的 JobID 可以通过 REST API、Web UI 或者日志文件得到。getKvState() 方法返回一个 CompletableFuture[S]，其中 S 是状态类得到。因此，客户端可以同时发出多个异步请求并等待期返回结果
+
+
+
+
+## 7. 读写外部系统
+### 应用的一致性保障
+* Flink 的检查点和恢复机制结合可重置的数据源连接器能够确保应用不会丢失数据。但由于在前一次成功的检查点（故障恢复时的回退位置）后发出的数据会被再次发送，所以应用可能会发出两次结果。因此，**可重置的数据源以及 Flink 的恢复机制虽然可以为应用状态提供精确一次的一致性保障，但无法提供端到端的精确一次保障**
+* 应用若想提供端到端的精确一次性保障，需要一些特殊的数据汇连接器。根据情况不同，这些连接器可以使用两种技术来实现精确一次保障：
+    - **幂等性写**
+        - 幂等操作可以多次执行，但只会引起一次改变。例如，将相同的键值对插入一个哈希映射就是一个幂等操作，因为在首次将键值对插入映射中后，目标键值对就已经存在，此时无论该操作重复几次都不会改变这个映射。
+        - 追加操作就不是幂等的，因为多次追加某个元素会导致它出现多次
+        - 幂等性写操作可以在不改变结果的前提下多次执行，因此可以在一定程度上减轻 Flink 检查点机制所带来的重复结果的影响
+    - **事务性写**
+        - 基本思路是只有在上次成功的检查点之前计算的结果才会被写入外部数据汇系统。该行为可以提供端到端的精确一次保障。因为在发生故障后，应用会被重置到上一个检查点，而接收系统不会收到任何在该检查点之后生成的结果
+        - 通过只在检查点完成后写入数据，事务性写虽然不会像幂等性写那样出现重放过程中的不一致现象，但会增加一定延迟，因为结果只有在检查点完成后才对外可见
+        - Flink 提供了两个构件来实现事务性的数据汇连接器：WAL（write-ahead log，写前日志）数据汇和 2PC（two-phase commit，两阶段提交）数据汇
+    
+#### WAL 数据汇
+* WAL 数据汇会将所有结果记录写入应用状态，并在收到检查点完成通知后将它们发送到数据汇系统
+* 然而，WAL 数据汇无法 100% 提供精确一次保障，此外还会导致应用状态大小增加以及接收系统需要处理一次次的“波峰式”写入
+
+#### 2PC 数据汇
+* 2PC 数据汇需要数据汇系统支持事务或提供可用来模拟事务的构件
+* 每次生成检查点，数据汇都会开启一次事务并将全部收到的记录附加到该事务中，即将它们写入接收系统但先不提交。直到收到检查点完成通知后，数据汇才会通过提交事务真正写入结果。该机制需要数据汇在故障恢复后能够提交某检查点完成前开启的事务
+* 2PC 协议需要基于 Flink 现有的检查点机制来完成。检查点分隔符可认为是开启新事务的通知，所有算子完成各自检查点的通知可看做是提交股票，而来自 JobManager 的检查点创建成功的消息其实是提交事务的指令。和 WAL 数据汇不同，2PC 数据汇可依赖数据汇系统和数据汇的实现来完成精确一次的结果输出
+* 此外，2PC 数据汇可以持续平稳地将记录写入接收系统，而不会像 WAL 数据汇那样经历周期性的“波峰式”写入
+
+
+
+
+## 8. Flink 和流式应用运维
+### 运行并管理流式应用
+* 为了对主进程、工作进程以及应用进行监控，Flink 对外公开了以下接口：
+    1. 一个用于提交和控制应用的命令行客户端工具
+    2. 一套用于命令行客户端和 Web UI 的底层 REST API。它可以供用户或脚本访问，还可用于获取所有系统及应用指标并作为提交和管理应用的服务端点
+    3. 一个用于提交有关 Flink 集群和当前运行应用详细信息及指标的 Web UI。它同时提供了基本的应用提交和管理功能
